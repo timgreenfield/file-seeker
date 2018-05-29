@@ -1,251 +1,180 @@
-﻿using FileSeeker.Common;
-using FileSeeker.Extensions;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Reactive.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using FileSeeker.Common;
+using Windows.Storage;
+using Windows.UI.Core;
 
 namespace FileSeeker
 {
-    public static class SearchEngine
-    {
-        public static IObservable<SearchResult> Search(string[] searchFor, string searchPattern, string path, bool recursive, bool matchCase, bool useRegularExpression, Encoding encoding)
-        {
-            return new ObserverableSearcher()
-            {
-                SearchFor = searchFor,
-                Encoding = encoding,
-                Path = path,
-                Recursive = recursive,
-                SearchPattern = searchPattern,
-                MatchCase = matchCase,
-                UseRegularExpression = useRegularExpression
-            };
-        }
-        public static IObservable<SearchResult> Replace(string[] searchFor, string replaceWith, string searchPattern, string path, bool recursive, bool matchCase, bool useRegularExpression, Encoding encoding)
-        {
-            return new ObservableReplacer()
-            {
-                SearchFor = searchFor,
-                ReplaceWith = replaceWith,
-                Encoding = encoding,
-                Path = path,
-                Recursive = recursive,
-                SearchPattern = searchPattern,
-                MatchCase = matchCase,
-                UseRegularExpression = useRegularExpression
-            };
-        }
-    }
-
-    internal class ObservableReplacer : ObserverableSearcher
-    {
-        public string ReplaceWith { get; set; }
-
-        protected override void OnMatchesFound(Regex regex, ref string data)
-        {
-            data = regex.Replace(data, ReplaceWith);
-            base.OnMatchesFound(regex, ref data);
-        }
-
-        protected override void OnSearchComplete(string file, Encoding detectedEncoding, ref string data)
-        {
-            using (var streamWriter = new StreamWriter(file, false, detectedEncoding))
-            {
-                streamWriter.Write(data);
-                streamWriter.Flush();
-            }
-            base.OnSearchComplete(file, detectedEncoding, ref data);
-        }
-    }
-
-    internal class ObserverableSearcher : IObservable<SearchResult>
+    public class SearchRequest
     {
         public string[] SearchFor { get; set; }
         public string Path { get; set; }
-        public string SearchPattern { get; set; }
+        public string[] FileTypeFilter { get; set; }
         public bool Recursive { get; set; }
         public bool MatchCase { get; set; }
         public bool UseRegularExpression { get; set; }
         public Encoding Encoding { get; set; }
+    }
 
-        public IDisposable Subscribe(IObserver<SearchResult> observer)
+    public class SearchAndReplaceRequest : SearchRequest
+    {
+        public string[] ReplaceWith { get; set; }
+    }
+
+    public static class SearchEngine
+    {
+        public static async Task SearchAsync(SearchRequest request, CoreDispatcher dispatcher, IProgress<SearchResult> progress, CancellationToken cancellationToken)
         {
-            var cancellationTokenSource = new CancellationTokenSource();
-            Task.Factory.StartNew(() => Go(observer, cancellationTokenSource.Token));
-            return new DisposableCancelationTokenSource(cancellationTokenSource);
-        }
+            var folder = await StorageFolder.GetFolderFromPathAsync(request.Path).AsTask(cancellationToken).ConfigureAwait(false);
+            var allFiles = GetAllFiles(folder, request.FileTypeFilter, request.Recursive);
 
-        protected virtual void OnSkipDirectory(string path)
-        { }
+            var searchTasks = new List<Task<SearchResult>>();
 
-        protected virtual void OnSkipSubDirectories(string path)
-        { }
-
-        protected virtual void OnSkipFile(string path)
-        { }
-
-        IEnumerable<string> GetAllFiles(string path)
-        {
-            IEnumerable<string> files = null;
-            try
+            await allFiles.ForEachAsync(file =>
             {
-                files = System.IO.Directory.GetFiles(path, SearchPattern);
-            }
-            catch (UnauthorizedAccessException)
+                searchTasks.Add(SearchFileAndReportProgressAsync(file, cancellationToken));
+            }, cancellationToken);
+
+            await Task.WhenAll(searchTasks);
+
+            async Task<SearchResult> SearchFileAndReportProgressAsync(IStorageFile file, CancellationToken c)
             {
-                OnSkipDirectory(path);
-            }
-            if (files != null)
-            {
-                foreach (var file in files)
+                var result = new SearchResult(file, dispatcher);
+                result.Status = SearchStatus.Searching;
+                progress.Report(result);
+
+                try
                 {
-                    yield return file;
+                    int occurrences = await SearchFileAsync(file, request, c);
+                    result.Occurrences = occurrences;
+                    result.Status = SearchStatus.Complete;
                 }
-            }
-
-            IEnumerable<string> directories = null;
-            try
-            {
-                directories = System.IO.Directory.GetDirectories(path);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                OnSkipSubDirectories(path);
-            }
-            if (directories != null)
-            {
-                foreach (var directory in directories)
+                catch (OperationCanceledException)
                 {
-                    foreach (var file in GetAllFiles(directory))
-                    {
-                        yield return file;
-                    }
+                    result.Status = SearchStatus.Canceled;
+                    throw;
                 }
+                catch
+                {
+                    result.Status = SearchStatus.Error;
+                }
+                finally
+                {
+                    progress.Report(result);
+                }
+
+                return result;
             }
         }
 
-        void Go(IObserver<SearchResult> observer, CancellationToken cancellationToken)
+        static IObservable<IStorageFile> GetAllFiles(IStorageFolder folder, string[] fileTypeFilter, bool recursive)
         {
-            try
+            return Observable.Create<IStorageFile>(async (observer, c) =>
             {
-                // this will throw if any folder has permission issues
-                //Directory.EnumerateFiles(Path, SearchPattern, Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly)
-                foreach (var file in GetAllFiles(Path))
+                await FindAllFilesAsync(observer, folder, c).ConfigureAwait(false);
+            });
+
+            async Task FindAllFilesAsync(IObserver<IStorageFile> observer, IStorageFolder inFolder, CancellationToken cancellationToken)
+            {
+                foreach (var file in await inFolder.GetFilesAsync().AsTask(cancellationToken).ConfigureAwait(false))
                 {
-                    var result = new SearchResult(file);
-                    if (cancellationToken.CheckIfCancelled(observer)) return;
-                    try
+                    if (fileTypeFilter.Contains(file.FileType))
                     {
-                        observer.OnNext(result);
-                        SearchFile(file, result);
-                        result.Status = SearchStatus.Complete;
+                        observer.OnNext(file);
                     }
-                    catch (IOException)
-                    {
-                        OnSkipFile(file);
-                        result.Status = SearchStatus.Error;
-                    }
-                    catch (UnauthorizedAccessException)
-                    {
-                        OnSkipFile(file);
-                        result.Status = SearchStatus.Error;
-                    }
-                    if (cancellationToken.CheckIfCancelled(observer)) return;
-                    observer.OnNext(result);
                 }
 
-                if (cancellationToken.CheckIfCancelled(observer)) return;
-                observer.OnCompleted();
-            }
-            catch (Exception ex)
-            {
-                observer.OnError(ex);
+                if (recursive)
+                {
+                    foreach (var childFolder in await inFolder.GetFoldersAsync().AsTask(cancellationToken).ConfigureAwait(false))
+                    {
+                        await FindAllFilesAsync(observer, childFolder, cancellationToken).ConfigureAwait(false);
+                    }
+                }
             }
         }
 
-        void SearchFile(string file, SearchResult result)
+        static async Task<int> SearchFileAsync(IStorageFile file, SearchRequest request, CancellationToken cancellationToken)
         {
-            Func<StreamReader> GetStreamReader = () =>
+            var streamToRead = await file.OpenStreamForReadAsync().ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            StreamReader GetStreamReader()
             {
-                if (Encoding == null)
-                    return new StreamReader(file, true);
+                if (request.Encoding == null)
+                    return new StreamReader(streamToRead, true);
                 else
-                    return new StreamReader(file, Encoding, true);
+                    return new StreamReader(streamToRead, request.Encoding, true);
             };
 
-            Encoding detectedEncoding;
+            int occurrences = 0;
             string data;
-
+            Encoding detectedEncoding;
             using (var streamReader = GetStreamReader())
             {
-                data = streamReader.ReadToEnd();
                 detectedEncoding = streamReader.CurrentEncoding;
-                foreach (var searchText in SearchFor)
+                data = streamReader.ReadToEnd();
+                cancellationToken.ThrowIfCancellationRequested();
+
+                for (int i = 0; i < request.SearchFor.Length; i++)
                 {
+                    var searchText = request.SearchFor[i];
                     string searchString;
-                    if (!UseRegularExpression)
+                    if (!request.UseRegularExpression)
                         searchString = Regex.Escape(searchText);
                     else
                         searchString = searchText;
-                    var regex = new Regex(searchString, MatchCase ? RegexOptions.None : RegexOptions.IgnoreCase);
+                    var regex = new Regex(searchString, request.MatchCase ? RegexOptions.None : RegexOptions.IgnoreCase);
 
                     var matches = regex.Matches(data);
                     if (matches.Count > 0)
                     {
-                        result.Occurrences += matches.Count;
-                        OnMatchesFound(regex, ref data);
+                        occurrences += matches.Count;
+                        if (request is SearchAndReplaceRequest replaceRequest)
+                        {
+                            var replaceText = replaceRequest.ReplaceWith[i];
+                            data = regex.Replace(data, replaceText);
+                        }
                     }
+
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
             }
 
-            if (result.Occurrences > 0)
+            if (request is SearchAndReplaceRequest)
             {
-                OnSearchComplete(file, detectedEncoding, ref data);
+                if (occurrences > 0)
+                {
+                    var streamToWrite = await file.OpenStreamForWriteAsync().ConfigureAwait(false);
+                    streamToWrite.SetLength(0);
+                    using (var streamWriter = new StreamWriter(streamToWrite, detectedEncoding))
+                    {
+                        streamWriter.Write(data);
+                        streamWriter.Flush();
+                    }
+                }
             }
+            return occurrences;
         }
-
-        protected virtual void OnSearchComplete(string file, Encoding detectedEncoding, ref string data)
-        { }
-
-        protected virtual void OnMatchesFound(Regex regex, ref string data)
-        { }
-    }
-
-    internal class DisposableCancelationTokenSource : IDisposable
-    {
-        CancellationTokenSource cts;
-
-        internal DisposableCancelationTokenSource(CancellationTokenSource cts)
-        {
-            this.cts = cts;
-        }
-
-        public void Dispose()
-        {
-            if (!IsDisposed)
-            {
-                cts.Cancel();
-                cts.Dispose();
-                cts = null;
-                IsDisposed = true;
-            }
-        }
-
-        public bool IsDisposed { get; private set; }
     }
 
     public sealed class SearchResult : Model
     {
-        internal SearchResult(string file)
+        internal SearchResult(IStorageFile file, CoreDispatcher dispatcher)
+            : base(dispatcher)
         {
             File = file;
-            Status = SearchStatus.Searching;
         }
-        public string File { get; private set; }
+
+        public IStorageFile File { get; private set; }
 
         int occurrences;
         public int Occurrences
@@ -254,7 +183,7 @@ namespace FileSeeker
             internal set
             {
                 occurrences = value;
-                OnPropertyChanged("Occurrences");
+                OnPropertyChanged(nameof(Occurrences));
             }
         }
 
@@ -265,8 +194,20 @@ namespace FileSeeker
             internal set
             {
                 status = value;
-                OnPropertyChanged("Status"); 
+                OnPropertyChanged(nameof(Status));
+                OnPropertyChanged(nameof(IsSearching));
+                OnPropertyChanged(nameof(IsFound));
             }
+        }
+
+        public bool IsFound
+        {
+            get { return Occurrences > 0 && Status == SearchStatus.Complete; }
+        }
+
+        public bool IsSearching
+        {
+            get { return Status == SearchStatus.Searching; }
         }
     }
 
@@ -274,6 +215,7 @@ namespace FileSeeker
     {
         Searching,
         Complete,
-        Error
+        Error,
+        Canceled
     }
 }

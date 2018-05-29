@@ -1,88 +1,57 @@
-﻿using FileSeeker.Common;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Diagnostics;
 using System.Linq;
 using System.Text;
-using System.Windows;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Input;
-using System.Windows.Threading;
+using FileSeeker.Common;
+using Windows.System;
+using Windows.UI.Core;
+using Windows.UI.Popups;
 
 namespace FileSeeker
 {
-    public class ViewModel : Model, IObserver<SearchResult>
+    public class ViewModel : Model
     {
-        IDisposable activeOperation;
+        CancellationTokenSource cts;
+        bool isBusy;
+        RelayCommand cancelCommand;
+        RelayCommand openCommand;
+        RelayCommand searchCommand;
+        RelayCommand replaceCommand;
+        string searchPattern;
+        string path;
+        string searchFor;
+        string replaceWith;
+        bool multipleValues;
+        bool matchCase;
+        bool recursive = true;
+        bool useRegularExpressions;
+        EncodingOption selectedEncoding;
+        IList<SearchResult> searchResults;
 
-        public ViewModel()
+        public ViewModel(CoreDispatcher dispatcher)
+            : base(dispatcher)
         {
+            Dispatcher = dispatcher;
+
             AvailableEncodings = new List<EncodingOption>(Encoding.GetEncodings().OrderBy(e => e.DisplayName).Select(e => new EncodingOption(e)));
             AvailableEncodings.Insert(0, new EncodingOption(null));
 
             LoadPreferences();
         }
 
-        IDisposable ActiveOperation
-        {
-            get { return activeOperation; }
-            set
-            {
-                activeOperation = value;
-                cancelCommand.RaiseCanExecuteChanged();
-            }
-        }
+        public CoreDispatcher Dispatcher { get; private set; }
 
-        public Dispatcher Dispatcher { get; set; }
-
-        public void OnNext(SearchResult result)
-        {
-            if (result.Status != SearchStatus.Error)
-            {
-                if (result.Status == SearchStatus.Searching)
-                {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        ActiveFile = result.File;
-                    }));
-                }
-                else if (result.Status == SearchStatus.Complete && result.Occurrences > 0)
-                {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        SearchResults.Add(result);
-                        OnPropertyChanged("TotalOccurrences");
-                    }));
-                }
-            }
-        }
-        public void OnCompleted()
-        {
-            Dispatcher.BeginInvoke(new Action(() =>
-            {
-                IsBusy = false;
-            }));
-        }
-        public void OnError(Exception error)
-        {
-            Dispatcher.BeginInvoke(new Action(() =>
-            {
-                IsBusy = false;
-                if (!(error is OperationCanceledException))
-                {
-                    MessageBox.Show(error.Message, "Unable to complete operation.");
-                }
-            }));
-        }
-
-        bool isBusy;
         public bool IsBusy
         {
             get { return isBusy; }
             set
             {
                 isBusy = value;
-                OnPropertyChanged("IsBusy");
+                OnPropertyChanged(nameof(IsBusy));
                 cancelCommand.RaiseCanExecuteChanged();
                 searchCommand.RaiseCanExecuteChanged();
                 replaceCommand.RaiseCanExecuteChanged();
@@ -93,21 +62,21 @@ namespace FileSeeker
         {
             get
             {
-                return IsBusy && ActiveOperation == null;
+                return IsBusy && cts?.IsCancellationRequested == true;
             }
         }
 
         private void LoadPreferences()
         {
-            searchPattern = Properties.Settings.Default.SearchPattern;
-            searchFor = Properties.Settings.Default.SearchFor;
-            replaceWith = Properties.Settings.Default.ReplaceWith;
-            path = Properties.Settings.Default.Path;
-            recursive = Properties.Settings.Default.Recursive;
-            matchCase = Properties.Settings.Default.MatchCase;
-            useRegularExpressions = Properties.Settings.Default.UseRegularExpressions;
-            multipleValues = Properties.Settings.Default.MultipleValues;
-            var encodingName = Properties.Settings.Default.SelectedEncoding;
+            searchPattern = Settings.SearchPattern;
+            searchFor = Settings.SearchFor;
+            replaceWith = Settings.ReplaceWith;
+            path = Settings.Path;
+            recursive = Settings.Recursive;
+            matchCase = Settings.MatchCase;
+            useRegularExpressions = Settings.UseRegularExpressions;
+            multipleValues = Settings.MultipleValues;
+            var encodingName = Settings.SelectedEncoding;
             if (!string.IsNullOrEmpty(encodingName))
             {
                 selectedEncoding = AvailableEncodings.FirstOrDefault(e => e.EncodingInfo != null && e.EncodingInfo.Name == encodingName);
@@ -120,19 +89,17 @@ namespace FileSeeker
 
         private void SavePreferences()
         {
-            Properties.Settings.Default.SearchPattern = SearchPattern;
-            Properties.Settings.Default.SearchFor = SearchFor;
-            Properties.Settings.Default.ReplaceWith = ReplaceWith;
-            Properties.Settings.Default.Path = Path;
-            Properties.Settings.Default.Recursive = Recursive;
-            Properties.Settings.Default.MatchCase = MatchCase;
-            Properties.Settings.Default.UseRegularExpressions = UseRegularExpressions;
-            Properties.Settings.Default.MultipleValues = MultipleValues;
-            Properties.Settings.Default.SelectedEncoding = SelectedEncoding.EncodingInfo != null ? SelectedEncoding.EncodingInfo.Name : string.Empty;
-            Properties.Settings.Default.Save();
+            Settings.SearchPattern = SearchPattern;
+            Settings.SearchFor = SearchFor;
+            Settings.ReplaceWith = ReplaceWith;
+            Settings.Path = Path;
+            Settings.Recursive = Recursive;
+            Settings.MatchCase = MatchCase;
+            Settings.UseRegularExpressions = UseRegularExpressions;
+            Settings.MultipleValues = MultipleValues;
+            Settings.SelectedEncoding = SelectedEncoding.EncodingInfo != null ? SelectedEncoding.EncodingInfo.Name : string.Empty;
         }
 
-        RelayCommand cancelCommand;
         public ICommand CancelCommand
         {
             get
@@ -140,17 +107,16 @@ namespace FileSeeker
                 if (cancelCommand == null)
                     cancelCommand = new RelayCommand(() =>
                     {
-                        if (ActiveOperation != null)
+                        if (cts != null)
                         {
-                            ActiveOperation.Dispose();
-                            ActiveOperation = null;
+                            cts.Cancel();
+                            cancelCommand.RaiseCanExecuteChanged();
                         }
                     }, () => !IsCancelling);
                 return cancelCommand;
             }
         }
 
-        RelayCommand openCommand;
         public ICommand OpenCommand
         {
             get
@@ -158,181 +124,264 @@ namespace FileSeeker
                 if (openCommand == null)
                     openCommand = new RelayCommand(arg =>
                     {
-                        var searchResult = arg as SearchResult;
-                        if (searchResult != null)
+                        if (arg is SearchResult searchResult)
                         {
-                            Process.Start("notepad.exe", searchResult.File);
+                            _ = Launcher.LaunchFileAsync(searchResult.File);
                         }
                     });
                 return openCommand;
             }
         }
 
-        RelayCommand searchCommand;
         public ICommand SearchCommand
         {
             get
             {
                 if (searchCommand == null)
-                    searchCommand = new RelayCommand(() =>
+                    searchCommand = new RelayCommand(async () =>
                     {
-                        IsBusy = true;
-
-                        SavePreferences();
-
-                        string[] searchForValues;
-                        if (MultipleValues)
+                        if (string.IsNullOrWhiteSpace(Path))
                         {
-                            searchForValues = SearchFor.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
+                            await new MessageDialog("Please provide a path to search before proceeding.").ShowAsync();
+                            return;
                         }
-                        else
+
+                        var request = CreateSearchRequest<SearchRequest>();
+
+                        using (cts = new CancellationTokenSource())
                         {
-                            searchForValues = new[] { SearchFor };
+                            IsBusy = true;
+                            try
+                            {
+                                await SearchAsync(request, cts.Token);
+                            }
+                            finally
+                            {
+                                IsBusy = false;
+                            }
                         }
-                        var results = SearchEngine.Search(searchForValues, SearchPattern, Path, Recursive, MatchCase, UseRegularExpressions, SelectedEncoding.EncodingInfo != null ? SelectedEncoding.EncodingInfo.GetEncoding() : null);
-                        SearchResults = new ObservableCollection<SearchResult>();
-                        ActiveOperation = results.Subscribe(this);
+                        cts = null;
                     }, () => !IsBusy);
                 return searchCommand;
             }
         }
 
-        RelayCommand replaceCommand;
         public ICommand ReplaceCommand
         {
             get
             {
                 if (replaceCommand == null)
-                    replaceCommand = new RelayCommand(() =>
+                    replaceCommand = new RelayCommand(async () =>
                     {
-                        IsBusy = true;
-
-                        SavePreferences();
-
-                        string[] searchForValues;
-                        if (MultipleValues)
+                        if (string.IsNullOrWhiteSpace(Path))
                         {
-                            searchForValues = SearchFor.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
+                            await new MessageDialog("Please provide a path to search before proceeding.").ShowAsync();
+                            return;
                         }
-                        else
+
+                        var msgDialog = new MessageDialog("This is a very powerful tool that you can use to alter data in any file that you have permission to modify. Therefore, Be VERY careful when doing replace operations to ensure you don’t accidentally modify files you don't intend to. Replace operations cannot be undone so double check your settings and backup your files before proceeding.", "WARNING");
+                        var proceedCommand = new UICommand("Proceed");
+                        msgDialog.Commands.Add(proceedCommand);
+                        msgDialog.Commands.Add(new UICommand("Cancel"));
+                        msgDialog.DefaultCommandIndex = 1;
+                        if (await msgDialog.ShowAsync() == proceedCommand)
                         {
-                            searchForValues = new[] { SearchFor };
+                            var request = CreateSearchRequest<SearchAndReplaceRequest>();
+                            if (MultipleValues)
+                            {
+                                request.ReplaceWith = ReplaceWith.Replace(Environment.NewLine, "\r").Split('\r', StringSplitOptions.RemoveEmptyEntries);
+                            }
+                            else
+                            {
+                                request.ReplaceWith = new[] { ReplaceWith };
+                            }
+
+                            using (cts = new CancellationTokenSource())
+                            {
+                                IsBusy = true;
+                                try
+                                {
+                                    await SearchAsync(request, cts.Token);
+                                }
+                                finally
+                                {
+                                    IsBusy = false;
+                                }
+                            }
+                            cts = null;
                         }
-                        var results = SearchEngine.Replace(searchForValues, ReplaceWith, SearchPattern, Path, Recursive, MatchCase, UseRegularExpressions, SelectedEncoding.EncodingInfo != null ? SelectedEncoding.EncodingInfo.GetEncoding() : null);
-                        SearchResults = new ObservableCollection<SearchResult>();
-                        ActiveOperation = results.Subscribe(this);
                     }, () => !IsBusy);
                 return replaceCommand;
             }
         }
 
-        string searchPattern;
+        private async Task SearchAsync(SearchRequest request, CancellationToken cancellationToken)
+        {
+            SavePreferences();
+
+            SearchResults = new ObservableCollection<SearchResult>();
+            var progress = new Progress<SearchResult>(result =>
+            {
+                switch (result.Status)
+                {
+                    case SearchStatus.Searching:
+                        SearchResults.Add(result);
+                        break;
+                    case SearchStatus.Complete:
+                        if (result.Occurrences == 0)
+                        {
+                            SearchResults.Remove(result);
+                        }
+                        else
+                        {
+                            OnPropertyChanged(nameof(TotalOccurrences));
+                        }
+                        break;
+                    case SearchStatus.Error:
+                        SearchResults.Remove(result);
+                        break;
+                    case SearchStatus.Canceled:
+                        SearchResults.Remove(result);
+                        break;
+                }
+            });
+
+            try
+            {
+                await SearchEngine.SearchAsync(request, Dispatcher, progress, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // ignore, we aborted operation
+            }
+            catch (Exception x)
+            {
+                await new MessageDialog(x.Message, "Unable to complete operation.").ShowAsync();
+            }
+        }
+
+        private T CreateSearchRequest<T>() where T : SearchRequest, new()
+        {
+            string[] searchForValues;
+            if (MultipleValues)
+            {
+                searchForValues = SearchFor.Replace(Environment.NewLine, "\r").Split('\r', StringSplitOptions.RemoveEmptyEntries);
+            }
+            else
+            {
+                searchForValues = new[] { SearchFor };
+            }
+
+            var request = new T()
+            {
+                SearchFor = searchForValues,
+                Encoding = SelectedEncoding.EncodingInfo?.GetEncoding(),
+                Path = path,
+                Recursive = recursive,
+                FileTypeFilter = string.IsNullOrWhiteSpace(searchPattern) ? new string[] { "*" } : searchPattern.Split(','),
+                MatchCase = matchCase,
+                UseRegularExpression = UseRegularExpressions
+            };
+            return request;
+        }
+
         public string SearchPattern
         {
             get { return searchPattern; }
             set
             {
                 searchPattern = value;
-                OnPropertyChanged("SearchPattern");
+                OnPropertyChanged(nameof(SearchPattern));
             }
         }
 
-        string path;
         public string Path
         {
             get { return path; }
             set
             {
                 path = value;
-                OnPropertyChanged("Path");
+                OnPropertyChanged(nameof(Path));
             }
         }
 
-        string searchFor;
         public string SearchFor
         {
             get { return searchFor; }
             set
             {
                 searchFor = value;
-                OnPropertyChanged("SearchFor");
+                OnPropertyChanged(nameof(SearchFor));
             }
         }
 
-        string replaceWith;
         public string ReplaceWith
         {
             get { return replaceWith; }
             set
             {
                 replaceWith = value;
-                OnPropertyChanged("ReplaceWith");
+                OnPropertyChanged(nameof(ReplaceWith));
             }
         }
 
-        bool multipleValues;
         public bool MultipleValues
         {
             get { return multipleValues; }
             set
             {
                 multipleValues = value;
-                OnPropertyChanged("MultipleValues");
+                OnPropertyChanged(nameof(MultipleValues));
             }
         }
 
-        bool matchCase;
         public bool MatchCase
         {
             get { return matchCase; }
             set
             {
                 matchCase = value;
-                OnPropertyChanged("MatchCase");
+                OnPropertyChanged(nameof(MatchCase));
             }
         }
 
-        bool recursive = true;
         public bool Recursive
         {
             get { return recursive; }
             set
             {
                 recursive = value;
-                OnPropertyChanged("Recursive");
+                OnPropertyChanged(nameof(Recursive));
             }
         }
 
-        bool useRegularExpressions;
         public bool UseRegularExpressions
         {
             get { return useRegularExpressions; }
             set
             {
                 useRegularExpressions = value;
-                OnPropertyChanged("UseRegularExpressions");
+                OnPropertyChanged(nameof(UseRegularExpressions));
             }
         }
 
-        EncodingOption selectedEncoding;
         public EncodingOption SelectedEncoding
         {
             get { return selectedEncoding; }
             set
             {
                 selectedEncoding = value;
-                OnPropertyChanged("SelectedEncoding");
+                OnPropertyChanged(nameof(SelectedEncoding));
             }
         }
 
-        IList<SearchResult> searchResults;
         public IList<SearchResult> SearchResults
         {
             get { return searchResults; }
             private set
             {
                 searchResults = value;
-                OnPropertyChanged("SearchResults");
+                OnPropertyChanged(nameof(SearchResults));
             }
         }
 
@@ -342,17 +391,6 @@ namespace FileSeeker
         }
 
         public IList<EncodingOption> AvailableEncodings { get; private set; }
-
-        string activeFile;
-        public string ActiveFile
-        {
-            get { return activeFile; }
-            set
-            {
-                activeFile = value;
-                OnPropertyChanged("ActiveFile");
-            }
-        }
     }
 
     public class EncodingOption

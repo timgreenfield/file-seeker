@@ -1,19 +1,28 @@
-﻿using System;
-using System.ComponentModel;
-using System.Runtime.CompilerServices;
+﻿using System.ComponentModel;
+using Windows.UI.Core;
 
 namespace FileSeeker.Common
 {
     public abstract class Model : INotifyPropertyChanged
     {
+        readonly CoreDispatcher dispatcher;
+
+        protected Model(CoreDispatcher dispatcher)
+        {
+            this.dispatcher = dispatcher;
+        }
 
         public event PropertyChangedEventHandler PropertyChanged;
 
         protected void OnPropertyChanged(string propertyName)
         {
-            if (PropertyChanged != null)
+            if (dispatcher.HasThreadAccess)
             {
-                PropertyChanged(this, new PropertyChangedEventArgs(propertyName));
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+            }
+            else
+            {
+                _ = dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => OnPropertyChanged(propertyName));
             }
         }
     }
